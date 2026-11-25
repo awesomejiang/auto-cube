@@ -2,7 +2,7 @@
 
 适用于 Windows 10/11 x64 的 Quanah 魔方工具。
 
-1. 在 Releases 下载 `Quanah-Cube-Windows-x64.zip`，解压整个文件夹。
+1. 打开 [Windows x64 便携包](https://github.com/awesomejiang/auto-cube/blob/windows-build/Quanah-Cube-Windows-x64.zip)，点击 **Download raw file**，解压整个文件夹。
 2. 双击 `Quanah-Cube.exe`，选 **1** 试读。按提示在 5 秒内切回魔方结果页。
 3. 确认左右 CP、材料和单次消耗读数正确后，重新打开程序，选 **2** 开始。
 
