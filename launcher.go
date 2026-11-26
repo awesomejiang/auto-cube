@@ -18,9 +18,12 @@ func launch() error {
 	base := filepath.Dir(executable)
 	input := bufio.NewReaderSize(os.Stdin, 16)
 	fmt.Println("Quanah Cube")
-	fmt.Println("1 = Preview OCR only")
-	fmt.Println("2 = Start automatic resets")
-	fmt.Print("Choose 1 or 2, then press Enter: ")
+	fmt.Println("1 = 试读 CP 和 AFTER 词条")
+	fmt.Println("2 = 右侧 CP 增加时停止")
+	fmt.Println("3 = 命中目标词条时停止")
+	fmt.Println("4 = 命中目标词条或右侧 CP 增加时停止")
+	fmt.Println("5 = 测试目标词条，只读不重洗")
+	fmt.Print("请选择 1–5，然后按回车：")
 	choice, err := input.ReadString('\n')
 	if err != nil {
 		return err
@@ -31,6 +34,12 @@ func launch() error {
 	case "1":
 		args = append(args, "--preview")
 	case "2":
+	case "3":
+		args = append(args, "--potential")
+	case "4":
+		args = append(args, "--potential", "--also-cp")
+	case "5":
+		args = append(args, "--preview", "--potential")
 	default:
 		return nil
 	}
