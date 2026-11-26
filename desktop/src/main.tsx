@@ -3,15 +3,23 @@ import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 
-type Mode = "preview" | "test" | "potential" | "either" | "cp";
+type Mode = "potential" | "either" | "cp";
 type Report = { running: boolean; error: boolean; lines: string[] };
 const emptyReport: Report = { running: false, error: false, lines: [] };
 const targetKey = "quanah-cube.targets";
-const categories = "STR DEX INT LUK ALL ATT MATT HP MP DEF BOSS IED DMG CRIT CRITDMG DROP MESO CD".split(" ");
+const categories = "STR DEX INT LUK ALL ATT MATT HP MP DEF BOSS IED DMG CRIT CRITDMG DROP MESO CD1 CD2".split(" ");
+const categoryLabels: Record<string, string> = {
+  ATT: "ATT %", MATT: "MATT %", CD1: "CDR -1 秒", CD2: "CDR -2 秒",
+};
 const cpKey = "quanah-cube.stop-on-cp";
+const detailedLogKey = "quanah-cube.detailed-log";
 
 function selectedCategories(target: string) {
-  return [...new Set(target.split("|").map(part => part.trim().toUpperCase()))]
+  const codes = target.split("|").flatMap(part => {
+    const code = part.trim().toUpperCase();
+    return code === "CD" ? ["CD1", "CD2"] : [code];
+  });
+  return [...new Set(codes)]
     .filter(part => categories.includes(part));
 }
 
@@ -30,10 +38,10 @@ function loadTargets(): string[] {
 function App() {
   const [targets, setTargets] = useState(loadTargets);
   const [stopOnCp, setStopOnCp] = useState(() => localStorage.getItem(cpKey) === "true");
+  const [detailedLog, setDetailedLog] = useState(() => localStorage.getItem(detailedLogKey) === "true");
   const [report, setReport] = useState(emptyReport);
   const [pending, setPending] = useState(false);
   const [message, setMessage] = useState("");
-  const [mode, setMode] = useState<Mode>("test");
   const log = useRef<HTMLPreElement>(null);
   const busy = pending || report.running;
   const hasTargets = targets.some(Boolean);
@@ -73,9 +81,10 @@ function App() {
     const normalized = targets.map(target => target.trim().toUpperCase());
     setPending(true);
     setMessage("");
-    setMode(nextMode);
     try {
-      await invoke("start_run", { mode: nextMode, targets: normalized.map(target => target || "*"), readCp: stopOnCp });
+      await invoke("start_run", {
+        mode: nextMode, targets: normalized.map(target => target || "*"), detailedLog,
+      });
       setReport({ running: true, error: false, lines: [] });
     } catch (error) {
       setMessage(String(error));
@@ -103,10 +112,9 @@ function App() {
     }
   }
 
-  const readOnly = mode === "test" || mode === "preview";
   const countdown = report.running ? report.lines.at(-1)?.match(/^切回游戏倒计时 (\d)$/)?.[1] : undefined;
   const outputLines = report.lines.filter(line => !line.startsWith("切回游戏倒计时 "));
-  const status = report.running ? (readOnly ? "正在读取" : "正在运行") :
+  const status = report.running ? "正在运行" :
     report.error ? "运行异常" : report.lines.length ? "已结束" : "待机";
 
   return (
@@ -118,7 +126,7 @@ function App() {
       </header>
         <section className="panel" aria-labelledby="targets-heading">
           <h2 id="targets-heading">目标词条</h2>
-          <p>三条可换序。每条可选多个备选，留空表示任意。</p>
+          <p>三条可换序。每条可选多个备选，留空表示任意。冷却缩减按总秒数计算。</p>
           <div className="target-list">
             {targets.map((target, index) => {
               const selected = selectedCategories(target);
@@ -130,7 +138,7 @@ function App() {
                     <button type="button" className="chip" disabled={busy} key={category}
                       aria-label={`移除条件 ${index + 1} 的 ${category}`}
                       onClick={() => updateTarget(index, selected.filter(value => value !== category).join("|"))}>
-                      {category} <span aria-hidden="true">×</span>
+                      {categoryLabels[category] ?? category} <span aria-hidden="true">×</span>
                     </button>
                   ))}
                   <select aria-label={`给条件 ${index + 1} 添加词条`} value="" disabled={busy || !available.length}
@@ -138,7 +146,7 @@ function App() {
                       if (event.target.value) updateTarget(index, [...selected, event.target.value].join("|"));
                     }}>
                     <option value="" disabled>{selected.length ? "添加备选" : "任意 · 选择词条"}</option>
-                    {available.map(category => <option key={category} value={category}>{category}</option>)}
+                    {available.map(category => <option key={category} value={category}>{categoryLabels[category] ?? category}</option>)}
                   </select>
                 </div>
               </div>;
@@ -159,12 +167,18 @@ function App() {
             ? <span className="countdown" role="status">切回游戏 · {countdown} 秒</span>
             : <span>先打开魔方结果页，再在 5 秒内切回游戏</span>}
         </div>
-        <pre ref={log} tabIndex={0} aria-label="运行输出">{outputLines.join("\n") || "试读或测试后，这里会显示当前读数。"}</pre>
+        <label className="cp-toggle">
+          <input type="checkbox" checked={detailedLog} disabled={busy}
+            onChange={event => {
+              setDetailedLog(event.target.checked);
+              localStorage.setItem(detailedLogKey, String(event.target.checked));
+            }} />
+          <span>详细日志</span>
+        </label>
+        <pre ref={log} tabIndex={0} aria-label="运行输出">{outputLines.join("\n") || "重洗结束后，这里会显示结果。"}</pre>
         {message && <p className="error" role="alert">{message}</p>}
       </section>
       <footer>
-        <button disabled={busy} onClick={() => void start("preview")}>试读</button>
-        <button className="test" disabled={busy} onClick={() => void start("test")}>测试词条 · 只读</button>
         <div className="spacer" />
         {report.running
           ? <button className="stop" disabled={pending} onClick={() => void stop()}>停止</button>

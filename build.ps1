@@ -78,6 +78,8 @@ try {
     $goRoot = Invoke-Checked $go @('env', 'GOROOT')
     Copy-Item -LiteralPath (Join-Path $goRoot 'LICENSE') -Destination (Join-Path $package 'Go-LICENSE.txt')
     Copy-Item -LiteralPath $launcher, (Join-Path $PSScriptRoot 'quanah_cube.py') -Destination $package
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'confirmation-templates') -Destination $package -Recurse
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'potential-templates') -Destination $package -Recurse
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README.md') -Destination (Join-Path $package 'README.txt')
 
     $desktop = Join-Path $PSScriptRoot 'desktop'

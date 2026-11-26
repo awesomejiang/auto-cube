@@ -58,7 +58,6 @@ button {
 }
 button:hover:not(:disabled) { filter: brightness(1.18); }
 button:disabled, input:disabled, select:disabled { opacity: .55; cursor: default; }
-.test { color: var(--gold); border-color: #765f3c; }
 .start { background: var(--gold); border-color: var(--gold); color: #221a14; }
 .stop { color: #ffbabd; border-color: #8f5359; }
 :focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }

@@ -1,4 +1,5 @@
 import ctypes
+import json
 import os
 import random
 import re
@@ -9,10 +10,10 @@ import time
 import unicodedata
 from ctypes import wintypes
 from functools import lru_cache
-from itertools import permutations
+from itertools import permutations, product
 from pathlib import Path
 
-from PIL import Image, ImageGrab, ImageOps
+from PIL import Image, ImageChops, ImageGrab, ImageOps, ImageStat
 import pytesseract
 
 KEY_INTERVAL = 0.20
@@ -40,6 +41,10 @@ COMPARISON_REGIONS = {
 FAILURE = "failure"
 RESULT = "result"
 stop_requested = threading.Event()
+COOLDOWN_LABEL = r"(?:all )?(?:skill )?cool\s*downs?(?: reduc(?:e|tion))?"
+COOLDOWN_NAMES = ("cooldown", "cool down", "skill cooldown", "skill cooldowns",
+                  "all skill cooldowns", "cooldown reduction", "skill cooldown reduction")
+COOLDOWN_SECONDS = {"CD1": 1, "CD2": 2}
 POTENTIAL_TYPES = {
     "STR": r"str",
     "DEX": r"dex",
@@ -47,7 +52,7 @@ POTENTIAL_TYPES = {
     "LUK": r"luk",
     "ALL": r"all stats?",
     "ATT": r"att(?:ack(?: power)?)?",
-    "MATT": r"m\.?\s?att(?:ack)?|magic (?:att(?:ack)?|power)",
+    "MATT": r"m\.?\s?att(?:ack)?|magic (?:att(?:ack)?(?: power)?|power)",
     "HP": r"(?:max )?hp",
     "MP": r"(?:max )?mp",
     "DEF": r"def(?:ense)?",
@@ -58,12 +63,13 @@ POTENTIAL_TYPES = {
     "CRITDMG": r"critical damage",
     "DROP": r"item drop rate",
     "MESO": r"mesos? (?:obtained|acquisition(?: rate)?)",
-    "CD": r"(?:skill )?cooldown(?: reduction)?",
+    "CD1": COOLDOWN_LABEL,
+    "CD2": COOLDOWN_LABEL,
 }
 POTENTIAL_LABELS = {
     "ALL": ("all stat", "all stats"),
     "ATT": ("att", "attack", "attack power"),
-    "MATT": ("matt", "m.att", "m.attack", "magic attack", "magic power"),
+    "MATT": ("matt", "m.att", "m.attack", "magic att", "magic attack", "magic attack power", "magic power"),
     "HP": ("hp", "max hp"),
     "MP": ("mp", "max mp"),
     "DEF": ("def", "defense"),
@@ -74,7 +80,8 @@ POTENTIAL_LABELS = {
     "CRITDMG": ("critical damage",),
     "DROP": ("item drop rate",),
     "MESO": ("meso obtained", "mesos obtained", "meso acquisition rate"),
-    "CD": ("cooldown", "skill cooldown", "cooldown reduction", "skill cooldown reduction"),
+    "CD1": COOLDOWN_NAMES,
+    "CD2": COOLDOWN_NAMES,
 }
 
 
@@ -83,7 +90,7 @@ def normalize_ocr_line(text):
     return " ".join(text.split())
 
 
-def parse_potential(text):
+def parse_potential(text, *, expected_count=3):
     lines = []
     for raw_line in text.splitlines():
         line = normalize_ocr_line(raw_line).lower()
@@ -91,15 +98,23 @@ def parse_potential(text):
         visible = line[:clipped.start()].strip() if clipped else line
         visible = re.sub(r"(?<=\d) +(?=\d)", "", visible)
         for kind, label in POTENTIAL_TYPES.items():
-            if re.fullmatch(rf"(?:{label})\s*[:+%-]?\s*[+-]?\s*\d+\s*(?:%|sec(?:onds?)?\.?)?", visible):
-                lines.append((kind, line if clipped else visible))
-                break
+            match = re.fullmatch(rf"(?:{label})\s*:?\s*(?P<sign>[+-]?)\s*(?P<value>\d+)\s*(?P<unit>%|sec(?:onds?)?\.?)?", visible)
+            if not match:
+                continue
+            sign, value, unit = match.group("sign", "value", "unit")
+            if kind in ("CD1", "CD2") and (sign != "-" or value != kind[-1] or unit == "%"):
+                continue
+            if kind in ("ATT", "MATT") and unit != "%":
+                kind = frozenset((kind,)) if clipped and unit is None else None
+            lines.append((kind, line if clipped else visible))
+            break
         else:
             # Keep recognizable non-target lines available for wildcard slots.
             if (re.fullmatch(r"[a-z][a-z ()/.'-]+\s*(?::\s*[+-]?|[+-])\s*\d+\s*%?", line)
                     or re.fullmatch(r"(?:enables? (?:the )?(?:use of )?)?[<«]?decent [a-z ]+[>»]?", line)
                     or re.fullmatch(r"\d+\s*% chance to ignore \d+\s*% damage", line)
-                    or re.fullmatch(r"hp recovery [il]tems and skills\s*[+:]?\s*\d+\s*%", line)):
+                    or re.fullmatch(r"hp recovery [il]tems and skills\s*[+:]?\s*\d+\s*%", line)
+                    or re.fullmatch(rf"{COOLDOWN_LABEL}\s*:?\s*[+-]?\s*\d+\s*sec(?:onds?)?\.?", visible)):
                 lines.append((None, line))
             elif clipped and len(re.findall(r"[a-z]", visible)) >= 3:
                 prefix = visible.rstrip(" :+-")
@@ -108,14 +123,17 @@ def parse_potential(text):
                     if any(label.startswith(prefix) for label in POTENTIAL_LABELS.get(kind, (kind.lower(),)))
                 )
                 kind = next(iter(candidates)) if len(candidates) == 1 else None
-                complete_label = kind and " " in prefix and prefix in POTENTIAL_LABELS.get(kind, ())
+                complete_label = (kind and kind not in ("ATT", "MATT") and " " in prefix
+                                  and prefix in POTENTIAL_LABELS.get(kind, ()))
                 lines.append((kind if complete_label else candidates or None, line))
-    return tuple(lines) if len(lines) == 3 else ()
+    return tuple(lines) if len(lines) == expected_count else ()
 
 
 def matches_potential(targets, lines):
     if len(lines) != 3:
         return False
+    if any(choices & COOLDOWN_SECONDS.keys() for choices in targets):
+        return matches_with_cooldown(targets, lines)
     possible = False
     for order in permutations(lines):
         if all("*" in choices or kind in choices for choices, (kind, _) in zip(targets, order)):
@@ -126,8 +144,33 @@ def matches_potential(targets, lines):
     return None if possible else False
 
 
+def matches_with_cooldown(targets, lines):
+    kinds = tuple(kind for kind, _ in lines)
+    possible = False
+    for selection in product(*targets):
+        required = tuple(kind for kind in selection if kind != "*" and kind not in COOLDOWN_SECONDS)
+        seconds = sum(COOLDOWN_SECONDS.get(kind, 0) for kind in selection)
+        for order in permutations(kinds):
+            assigned = tuple(zip(required, order))
+            remaining = order[len(required):]
+            if (all(wanted == actual for wanted, actual in assigned)
+                    and sum(COOLDOWN_SECONDS.get(kind, 0) for kind in remaining) >= seconds):
+                return True
+            if all(wanted in actual if isinstance(actual, frozenset) else wanted == actual
+                   for wanted, actual in assigned):
+                possible_seconds = sum(
+                    max((COOLDOWN_SECONDS.get(candidate, 0) for candidate in kind), default=0)
+                    if isinstance(kind, frozenset) else COOLDOWN_SECONDS.get(kind, 0)
+                    for kind in remaining
+                )
+                possible |= possible_seconds >= seconds
+    return None if possible else False
+
+
 def parse_target(value):
     choices = frozenset(part.strip() for part in (value.strip().upper() or "*").split("|"))
+    if "CD" in choices:
+        choices = (choices - {"CD"}) | {"CD1", "CD2"}
     if choices == {"*"} or choices <= POTENTIAL_TYPES.keys():
         return choices
     raise ValueError("请输入词条类别，例如 STR|ALL，或留空。")
@@ -231,7 +274,55 @@ def find_comparison_pair(gray):
     return pairs[0] if len(pairs) == 1 else None
 
 
-def comparison_reading(frame, *, require_reset=False, read_cp=True):
+def potential_fingerprint(row):
+    mask = ImageOps.grayscale(row).point([0] * 145 + [255] * 111, mode="1")
+    box = mask.getbbox()
+    if box is None:
+        return None
+    ink = mask.crop(box)
+    return ink.size, ink.tobytes()
+
+
+@lru_cache(maxsize=1)
+def potential_templates():
+    directory = Path(__file__).with_name("potential-templates")
+    try:
+        entries = json.loads((directory / "rows.json").read_text(encoding="utf-8"))
+        templates = {}
+        for filename, text in entries.items():
+            with Image.open(directory / filename) as image:
+                fingerprint = potential_fingerprint(image)
+            if fingerprint is not None:
+                templates.setdefault(fingerprint, text)
+                if templates[fingerprint] != text:
+                    templates[fingerprint] = None
+        return templates
+    except (OSError, ValueError):
+        return {}
+
+
+def panel_pixels(frame, x, y, scale):
+    # Include Reset x1 so unchanged headers alone cannot signal a ready result.
+    regions = ((-2, -2, 96, 23), (486, -2, 570, 23), COMPARISON_REGIONS["reset"])
+    return tuple(
+        ImageOps.grayscale(frame.crop((
+            round(x + left * scale), round(y + top * scale),
+            round(x + right * scale), round(y + bottom * scale),
+        ))).tobytes()
+        for left, top, right, bottom in regions
+    )
+
+
+def cached_comparison_position(frame, panel):
+    saved = panel.get("position") if panel is not None else None
+    if saved is not None:
+        size, position, signatures = saved
+        if size == frame.size and panel_pixels(frame, *position) == signatures:
+            return position
+    return None
+
+
+def locate_comparison_position(frame):
     gray = ImageOps.grayscale(frame)
     x_offset, y_offset = round(frame.width * .24), round(frame.height * .32)
     title_band = gray.crop((x_offset, y_offset, round(frame.width * .76), round(frame.height * .43)))
@@ -243,26 +334,68 @@ def comparison_reading(frame, *, require_reset=False, read_cp=True):
         raise ValueError("未能定位唯一的一组 BEFORE / AFTER 标题")
     (x, y, _), (after_x, _, _) = pair
     scale = (after_x - x) / 488
-    x += x_offset
-    y += y_offset
+    return x + x_offset, y + y_offset, scale
 
-    def read(name, **options):
+
+def comparison_reading(frame, *, read_cp=True, targets=None, panel=None):
+    position = cached_comparison_position(frame, panel)
+    found_position = position is None
+    if found_position:
+        position = locate_comparison_position(frame)
+    x, y, scale = position
+
+    def region(name):
         left, top, right, bottom = COMPARISON_REGIONS[name]
         box = (round(x + left * scale), round(y + top * scale),
                round(x + right * scale), round(y + bottom * scale))
         if box[0] < 0 or box[1] < 0 or box[2] > frame.width or box[3] > frame.height:
-            return ""
-        return ocr_box(frame, box, psm=7, **options)
+            return None
+        return box
+
+    def read(name, **options):
+        box = region(name)
+        return ocr_box(frame, box, psm=7, **options) if box is not None else ""
 
     if not all("combat power change" in read(name).lower()
                for name in ("left_cp_label", "right_cp_label")):
         raise ValueError("已定位比较面板，但未能确认两侧 Combat Power Change 标题")
-    raw_lines = [
-        read(f"after_{index}", threshold=150).strip()
-        for index in range(1, 4)
-    ]
-    lines = parse_potential("\n".join(raw_lines))
-    if not lines:
+    if found_position and panel is not None:
+        panel["position"] = (frame.size, position, panel_pixels(frame, *position))
+    templates = potential_templates()
+    names = tuple(f"after_{index}" for index in range(1, 4))
+    raw_lines = [""] * 3
+    known_lines = [None] * 3
+    unknown = (frozenset(POTENTIAL_TYPES), "未读取（已确定未命中目标）")
+
+    def settled_lines():
+        lines = tuple(line if line is not None else unknown for line in known_lines)
+        if all(line is not None for line in known_lines):
+            return lines
+        if targets is not None and matches_potential(targets, lines) is False:
+            return lines
+        return None
+
+    for index, name in enumerate(names):
+        box = region(name)
+        text = templates.get(potential_fingerprint(frame.crop(box))) if box and templates else None
+        if text:
+            raw_lines[index] = text
+            parsed = parse_potential(text, expected_count=1)
+            if parsed:
+                known_lines[index] = parsed[0]
+    lines = settled_lines()
+    if lines is None:
+        for index, name in enumerate(names):
+            if known_lines[index] is not None:
+                continue
+            raw_lines[index] = read(name, threshold=150).strip()
+            parsed = parse_potential(raw_lines[index], expected_count=1)
+            if parsed:
+                known_lines[index] = parsed[0]
+            lines = settled_lines()
+            if lines is not None:
+                break
+    if lines is None:
         raw = " | ".join(line or "（空）" for line in raw_lines)
         raise ValueError(f"无法确认三条 AFTER 词条。OCR 原文：{raw}")
     values = []
@@ -281,7 +414,7 @@ def comparison_reading(frame, *, require_reset=False, read_cp=True):
                     side = "左侧" if name == "left" else "右侧"
                     raise ValueError(f"{side} CP 数值无法确认。OCR 原文：{text.strip() or '（空）'}") from error
         values.append(value)
-    if require_reset and not re.search(r"\breset\s*x\s*1\b", read("reset").lower()):
+    if not re.search(r"\breset\s*x\s*1\b", read("reset").lower()):
         raise ValueError("已读取 CP 和词条，但未能确认 Reset x1")
     return tuple(values) if read_cp else (None, None), lines
 
@@ -296,6 +429,39 @@ def has_teal_dialog(frame):
         if matches >= 16:
             return True
     return False
+
+
+CONFIRMATION_PATCHES = {
+    "confirm1": {"message": (1087, 638, 1474, 706), "buttons": (1107, 766, 1453, 824)},
+    "confirm2": {"message": (1192, 687, 1369, 719), "crystal": (1240, 634, 1398, 662),
+                 "buttons": (1107, 800, 1453, 858)},
+}
+
+
+@lru_cache(maxsize=5)
+def confirmation_template(name):
+    try:
+        with Image.open(Path(__file__).with_name("confirmation-templates") / f"{name}.png") as image:
+            return image.convert("RGB")
+    except OSError:
+        return None
+
+
+def matches_confirmation_template(frame, expected):
+    for name, bounds in CONFIRMATION_PATCHES[expected].items():
+        template = confirmation_template(f"{expected}-{name}")
+        if template is None:
+            return False
+        left, top, right, bottom = bounds
+        box = (round(left * frame.width / 2560), round(top * frame.height / 1440),
+               round(right * frame.width / 2560), round(bottom * frame.height / 1440))
+        patch = frame.crop(box).convert("RGB")
+        if patch.size != template.size:
+            patch = patch.resize(template.size, Image.Resampling.BILINEAR)
+        difference = ImageChops.difference(template, patch)
+        if max(ImageStat.Stat(difference).rms) > 12:
+            return False
+    return True
 
 
 def read_confirmation(frame, expected):
@@ -342,8 +508,72 @@ class Input(ctypes.Structure):
     _fields_ = [("kind", wintypes.DWORD), ("data", InputData)]
 
 
+class BitmapHeader(ctypes.Structure):
+    _fields_ = [
+        ("size", wintypes.DWORD), ("width", wintypes.LONG), ("height", wintypes.LONG),
+        ("planes", wintypes.WORD), ("bits", wintypes.WORD), ("compression", wintypes.DWORD),
+        ("image_size", wintypes.DWORD), ("x_pixels_per_meter", wintypes.LONG),
+        ("y_pixels_per_meter", wintypes.LONG), ("colors_used", wintypes.DWORD),
+        ("important_colors", wintypes.DWORD),
+    ]
+
+
+class RegionCapture:
+    def __init__(self, user):
+        self.user = user
+        self.gdi = gdi = ctypes.WinDLL("gdi32", use_last_error=True)
+        handle, integer = wintypes.HANDLE, ctypes.c_int
+        user.GetDC.argtypes, user.GetDC.restype = (handle,), handle
+        user.ReleaseDC.argtypes = (handle, handle)
+        gdi.CreateCompatibleDC.argtypes, gdi.CreateCompatibleDC.restype = (handle,), handle
+        gdi.CreateDIBSection.argtypes = (
+            handle, ctypes.POINTER(BitmapHeader), wintypes.UINT,
+            ctypes.POINTER(ctypes.c_void_p), handle, wintypes.DWORD,
+        )
+        gdi.CreateDIBSection.restype = handle
+        gdi.SelectObject.argtypes, gdi.SelectObject.restype = (handle, handle), handle
+        gdi.BitBlt.argtypes = (
+            handle, integer, integer, integer, integer, handle, integer, integer, wintypes.DWORD,
+        )
+        gdi.GdiFlush.argtypes = ()
+        gdi.DeleteDC.argtypes = (handle,)
+        gdi.DeleteObject.argtypes = (handle,)
+
+    def grab(self, x, y, width, height):
+        screen = self.user.GetDC(None)
+        if not screen:
+            raise OSError("GetDC failed")
+        target = bitmap = previous = None
+        try:
+            target = self.gdi.CreateCompatibleDC(screen)
+            if not target:
+                raise OSError("CreateCompatibleDC failed")
+            header = BitmapHeader(ctypes.sizeof(BitmapHeader), width, -height, 1, 32)
+            pixels = ctypes.c_void_p()
+            bitmap = self.gdi.CreateDIBSection(screen, ctypes.byref(header), 0, ctypes.byref(pixels), None, 0)
+            if not bitmap or not pixels.value:
+                raise OSError("CreateDIBSection failed")
+            previous = self.gdi.SelectObject(target, bitmap)
+            if previous in (None, ctypes.c_void_p(-1).value):
+                previous = None
+                raise OSError("SelectObject failed")
+            if not self.gdi.BitBlt(target, 0, 0, width, height, screen, x, y, 0x00CC0020):
+                raise OSError("BitBlt failed")
+            self.gdi.GdiFlush()
+            return Image.frombytes("RGB", (width, height), ctypes.string_at(pixels, width * height * 4),
+                                   "raw", "BGRX")
+        finally:
+            if previous:
+                self.gdi.SelectObject(target, previous)
+            if bitmap:
+                self.gdi.DeleteObject(bitmap)
+            if target:
+                self.gdi.DeleteDC(target)
+            self.user.ReleaseDC(None, screen)
+
+
 class Window:
-    def __init__(self):
+    def __init__(self, *, detailed_log=True):
         user = ctypes.WinDLL("user32", use_last_error=True)
         try:
             user.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
@@ -358,12 +588,14 @@ class Window:
         user.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(Input), ctypes.c_int)
         user.SendInput.restype = wintypes.UINT
         self.user = user
+        self.capture = RegionCapture(user)
         self.handle = user.GetForegroundWindow()
         title = ctypes.create_unicode_buffer(512)
         user.GetWindowTextW(self.handle, title, len(title))
         if not self.handle or not title.value:
             raise RuntimeError("没有读到前台窗口标题")
-        print(f"已锁定窗口 {title.value}", flush=True)
+        if detailed_log:
+            print(f"已锁定窗口 {title.value}", flush=True)
 
     def check(self):
         if stop_requested.is_set():
@@ -391,8 +623,11 @@ class Window:
             raise RuntimeError("无法读取窗口位置")
         if rect.right < 640 or rect.bottom < 480:
             raise RuntimeError("窗口尺寸过小")
-        return ImageGrab.grab((origin.x, origin.y, origin.x + rect.right,
-                               origin.y + rect.bottom), all_screens=True)
+        try:
+            return self.capture.grab(origin.x, origin.y, rect.right, rect.bottom)
+        except OSError:
+            return ImageGrab.grab((origin.x, origin.y, origin.x + rect.right,
+                                   origin.y + rect.bottom), all_screens=True)
 
     def key(self, vk):
         self.check()
@@ -417,9 +652,9 @@ class Window:
         self.pause(KEY_INTERVAL + random.uniform(-KEY_JITTER, KEY_JITTER))
 
 
-def wait_for(window, expected, *, allow_failure=True, read_potential=False,
-             require_potential=False, stop_on_cp=False, preview=False, read_cp=True):
-    deadline = time.monotonic() + TIMEOUT
+def wait_for(window, expected, *, allow_failure=True, read_cp=True, targets=None, panel=None):
+    started = time.monotonic()
+    deadline = started + TIMEOUT
     previous = None
     comparison_error = None
     while time.monotonic() < deadline:
@@ -427,9 +662,12 @@ def wait_for(window, expected, *, allow_failure=True, read_potential=False,
         modal = has_teal_dialog(frame)
         state = None
         if modal and expected in ("confirm1", "confirm2"):
-            cropped = read_confirmation(frame, expected)
-            state = classify(cropped, "", True)
-            comparison_error = "确认框 OCR 原文：" + " | ".join(cropped.splitlines())
+            if matches_confirmation_template(frame, expected):
+                state = expected
+            else:
+                cropped = read_confirmation(frame, expected)
+                state = classify(cropped, "", True)
+                comparison_error = "确认框 OCR 原文：" + " | ".join(cropped.splitlines())
         if state is None and (modal or expected != RESULT):
             state = classify(ocr(frame, "dialog"), "", modal)
         observed = None
@@ -437,17 +675,25 @@ def wait_for(window, expected, *, allow_failure=True, read_potential=False,
             observed = (state, None)
         elif state == expected and state != RESULT:
             observed = (state, None)
+        if (expected == RESULT and state is None and not modal and panel
+                and time.monotonic() - started < 0.6
+                and cached_comparison_position(frame, panel) is None):
+            previous = None
+            window.pause(0.12)
+            continue
         if observed is None and expected == RESULT and state is None and not modal:
             try:
-                observed = (RESULT, comparison_reading(frame, require_reset=not preview, read_cp=read_cp))
+                observed = (RESULT, comparison_reading(
+                    frame, read_cp=read_cp, targets=targets, panel=panel
+                ))
             except ValueError as error:
                 comparison_error = str(error)
         if observed is None and expected == RESULT and state is None and not modal:
             if classify(ocr(frame, "dialog"), ocr(frame, "reset")) == RESULT:
                 try:
                     values = numbers(frame) if read_cp else (None, None)
-                    lines = parse_potential(ocr(frame, "after_lines", psm=6)) if read_potential else ()
-                    if lines or not require_potential or (stop_on_cp and values[1] > values[0]):
+                    lines = parse_potential(ocr(frame, "after_lines", psm=6)) if targets is not None else ()
+                    if lines or targets is None or (read_cp and values[1] > values[0]):
                         observed = (RESULT, (values, lines))
                 except ValueError:
                     pass
@@ -456,7 +702,7 @@ def wait_for(window, expected, *, allow_failure=True, read_potential=False,
         if observed is not None:
             comparison_error = "连续两次读取尚未一致"
         previous = observed
-        window.pause(0.25)
+        window.pause(0.12 if observed is not None else 0.25)
     stage = {RESULT: "结果页", "confirm1": "首次重洗确认框", "confirm2": "材料确认框"}[expected]
     detail = comparison_error or "未能确认该界面"
     raise RuntimeError(f"等待{stage}超时\n原因：{detail}")
@@ -472,33 +718,20 @@ def play_stop_sound(frequencies):
         pass
 
 
-def run(window, preview=False, targets=None, stop_on_cp=True, max_rounds=None):
+def run(window, targets=None, stop_on_cp=True, *, detailed_log=True):
     reading_options = {
-        "read_potential": preview or targets is not None,
-        "require_potential": targets is not None and not preview,
-        "stop_on_cp": stop_on_cp,
-        "preview": preview,
         "read_cp": stop_on_cp,
+        "targets": targets,
+        "panel": {},
     }
     _, (values, lines) = wait_for(window, RESULT, allow_failure=False, **reading_options)
-    attempts = rounds = 0
     while True:
         left, right = values
-        if left is not None:
+        if detailed_log and left is not None:
             print(f"左 CP {left:,} | 右 CP {right:,}", flush=True)
-        if lines:
+        if detailed_log and lines:
             print("AFTER 词条  " + " | ".join(line for _, line in lines), flush=True)
-        elif preview:
-            print("未能确认三条 AFTER 词条", flush=True)
         match = matches_potential(targets, lines) if targets is not None else False
-        if preview:
-            if targets is not None:
-                if not lines or match is None:
-                    return "测试结束：AFTER 词条无法确认是否命中"
-                if match:
-                    return "测试结束：AFTER 词条符合条件"
-                return "测试结束：AFTER 词条未命中"
-            return "试读结束"
         if match:
             play_stop_sound((660, 880))
             return "AFTER 词条符合条件，请在游戏中选择 AFTER"
@@ -507,46 +740,31 @@ def run(window, preview=False, targets=None, stop_on_cp=True, max_rounds=None):
             return "右侧 CP 更高，请在游戏中选择 AFTER"
         if match is None:
             return "AFTER 有截断词条可能命中目标，请在游戏中确认"
-        if max_rounds is not None and attempts >= max_rounds:
-            return f"已达到 {max_rounds} 次重洗尝试上限，确认完成 {rounds} 轮"
         for expected in ("confirm1", "confirm2", RESULT):
-            if expected == RESULT:
-                attempts += 1
             window.key(0x20)
-            if expected == "confirm1":
-                print("Windows 已接受空格按下和松开，等待首次确认框", flush=True)
-            started = time.monotonic()
             state, reading = wait_for(window, expected, **reading_options)
-            if state != FAILURE:
-                stage = {"confirm1": "首次确认框", "confirm2": "材料确认框", RESULT: "新结果"}[state]
-                print(f"{stage}识别耗时 {time.monotonic() - started:.1f} 秒", flush=True)
             if state == FAILURE:
-                print("服务器提示稍后重试，正在关闭提示框", flush=True)
+                if detailed_log:
+                    print("服务器提示稍后重试，正在关闭提示框", flush=True)
                 window.pause(KEY_INTERVAL + random.uniform(-KEY_JITTER, KEY_JITTER))
                 window.key(0x0D)
                 _, (values, lines) = wait_for(window, RESULT, allow_failure=False, **reading_options)
                 break
             if state == RESULT:
-                rounds += 1
                 values, lines = reading
-                if max_rounds is not None:
-                    print(f"已完成 {rounds}/{max_rounds} 轮", flush=True)
 
 
 def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--preview", action="store_true")
     parser.add_argument("--potential", action="store_true")
     parser.add_argument("--also-cp", action="store_true")
-    parser.add_argument("--skip-cp", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--target", nargs=3, metavar=("FIRST", "SECOND", "THIRD"))
     parser.add_argument("--switch-now", action="store_true")
-    parser.add_argument("--max-rounds", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--brief", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.max_rounds is not None and args.max_rounds < 1:
-        parser.error("重洗上限必须大于 0")
+    detailed_log = not args.brief
     if args.target is not None:
         try:
             targets = [parse_target(value) for value in args.target]
@@ -580,7 +798,8 @@ def main():
                 stop_requested.set()
 
         threading.Thread(target=listen_for_stop, daemon=True).start()
-        print("请在 5 秒内切回游戏的魔方结果页。", flush=True)
+        if detailed_log:
+            print("请在 5 秒内切回游戏的魔方结果页。", flush=True)
         for seconds in range(5, 0, -1):
             print(f"切回游戏倒计时 {seconds}", flush=True)
             if stop_requested.wait(1):
@@ -590,10 +809,13 @@ def main():
         input("请先打开魔方结果页。按回车后有 5 秒切回游戏窗口……")
         time.sleep(5)
     try:
-        stop_on_cp = not args.skip_cp and (args.preview or targets is None or args.also_cp)
-        print(run(Window(), args.preview, targets, stop_on_cp, args.max_rounds))
+        print(run(Window(detailed_log=detailed_log), targets, targets is None or args.also_cp,
+                  detailed_log=detailed_log))
     except RuntimeError as error:
-        print(f"已停止。{error}")
+        message = str(error)
+        if not detailed_log:
+            message = message.partition("\n")[0]
+        print(f"已停止。{message}")
 
 
 if __name__ == "__main__":

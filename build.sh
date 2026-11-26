@@ -26,6 +26,8 @@ test -s "$package/ocr/doc/LICENSE"
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o "$package/Quanah-Cube.exe" launcher.go
 cp "$(go env GOROOT)/LICENSE" "$package/Go-LICENSE.txt"
 cp quanah_cube.py launcher.go "$package/"
+cp -r confirmation-templates "$package/"
+cp -r potential-templates "$package/"
 cp README.md "$package/README.txt"
 (cd "$build" && zip -qr Quanah-Cube-Windows-x64.zip Quanah-Cube)
 unzip -tq "$build/Quanah-Cube-Windows-x64.zip"

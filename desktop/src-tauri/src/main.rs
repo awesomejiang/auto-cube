@@ -68,7 +68,7 @@ fn package_dir() -> Result<PathBuf, String> {
 fn start_run(
     mode: String,
     targets: [String; 3],
-    read_cp: bool,
+    detailed_log: bool,
     state: tauri::State<'_, Shared>,
 ) -> Result<(), String> {
     let directory = package_dir()?;
@@ -85,12 +85,6 @@ fn start_run(
         .creation_flags(0x08000000); // CREATE_NO_WINDOW
 
     match mode.as_str() {
-        "preview" => {
-            command.arg("--preview");
-        }
-        "test" => {
-            command.arg("--preview").arg("--target").args(targets);
-        }
         "potential" => {
             command.arg("--target").args(targets);
         }
@@ -100,8 +94,8 @@ fn start_run(
         "cp" => {}
         _ => return Err("无效的运行模式".to_owned()),
     }
-    if matches!(mode.as_str(), "preview" | "test") {
-        command.arg(if read_cp { "--also-cp" } else { "--skip-cp" });
+    if !detailed_log {
+        command.arg("--brief");
     }
 
     let mut session = state.lock().unwrap();
